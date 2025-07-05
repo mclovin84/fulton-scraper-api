@@ -27,12 +27,12 @@ function normalizeAddress(address) {
   for (let [k,v] of Object.entries(ABBREV)) {
     s = s.replace(new RegExp(`\\b${k}\\b`,'g'), v);
   }
-  // Strip trailing GA/ZIP
+  // Strip trailing GA/ZIP/city
   s = s.replace(/\b(ATLANTA|AUGUSTA|COLUMBUS|MACON|SAVANNAH|ATHENS|GA|GEORGIA)\b.*$/,'').trim();
   return s.replace(/\s+/g,' ');
 }
 
-/** Scrape the qPublic Fulton County site for owner info */
+/** Scrape qPublic Fulton County site for owner info */
 async function fetchOwnerData(address) {
   const browser = await puppeteer.connect({
     browserWSEndpoint: process.env.BROWSER_WS_ENDPOINT
@@ -40,35 +40,42 @@ async function fetchOwnerData(address) {
   const page = await browser.newPage();
 
   try {
-    // 1) Go to search page
+    // 1) Navigate to search page
     await page.goto(
       'https://qpublic.schneidercorp.com/Application.aspx?App=FultonCountyGA&Layer=Parcels&PageType=Search',
       { waitUntil:'networkidle2', timeout:30000 }
     );
 
-    // 2) Click the “Accept” or “I Agree” button if it appears
-    //    Valid selectors: input[type="submit"][value*="Accept"], button span with text
-    const acceptBtn = await page.$(
-      'input[type="submit"][value*="Accept"], input[type="button"][value*="Agree"], button:has-text("Agree")'
-    );
-    if (acceptBtn) {
-      await acceptBtn.click();
-      await page.waitForTimeout(1000);
+    // 2) Click “Accept” or “Agree” if present
+    try {
+      const btn = await page.$('input[type="submit"][value*="Accept"], input[type="button"][value*="Agree"]');
+      if (btn) {
+        await btn.click();
+        await page.waitForTimeout(1000);
+      } else {
+        const [xpathBtn] = await page.$x("//button[contains(text(),'Agree') or contains(text(),'Accept')]");
+        if (xpathBtn) {
+          await xpathBtn.click();
+          await page.waitForTimeout(1000);
+        }
+      }
+    } catch (e) {
+      console.log('No Accept/Agree button found');
     }
 
-    // 3) Choose the address search input
-    let addressSel = 'input[placeholder*="Enter address"]';
-    if (!await page.$(addressSel)) {
-      addressSel = '#SearchTextBox';
+    // 3) Wait for search input (new placeholder or old ID)
+    let selector = 'input[placeholder*="Enter address"]';
+    if (!await page.$(selector)) {
+      selector = '#SearchTextBox';
     }
-    await page.waitForSelector(addressSel, { timeout:10000 });
+    await page.waitForSelector(selector, { timeout:10000 });
 
-    // 4) Type the normalized address
+    // 4) Type normalized address
     const norm = normalizeAddress(address);
-    await page.click(addressSel, { clickCount:3 });
-    await page.type(addressSel, norm);
+    await page.click(selector, { clickCount: 3 });
+    await page.type(selector, norm);
 
-    // 5) Click the Search button (or press Enter)
+    // 5) Submit search
     const searchBtn = await page.$('input[type="submit"][value="Search"], button:has-text("Search")');
     if (searchBtn) {
       await searchBtn.click();
@@ -76,25 +83,23 @@ async function fetchOwnerData(address) {
       await page.keyboard.press('Enter');
     }
 
-    // 6) Wait for the results and click the first parcel link
+    // 6) Wait for results and open first parcel
     await page.waitForSelector('table.searchResultsGrid a', { timeout:15000 });
     await page.click('table.searchResultsGrid a');
 
-    // 7) Wait for the “Most Current Owner” cell
+    // 7) Wait for owner info section
     await page.waitForSelector('td:has-text("Most Current Owner")', { timeout:15000 });
 
-    // 8) Extract owner name & mailing address
+    // 8) Extract owner & mailing address
     const { owner, mailing } = await page.evaluate(() => {
       const clean = txt => txt.replace(/\s+/g,' ').trim();
       let o='Not found', m='Not found';
-      // Owner
-      const ownerTd = [...document.querySelectorAll('td')]
+      const ownerTd = Array.from(document.querySelectorAll('td'))
         .find(td => /Most Current Owner/i.test(td.textContent));
       if (ownerTd?.nextElementSibling) {
         o = clean(ownerTd.nextElementSibling.textContent);
       }
-      // Mailing
-      const mailTd = [...document.querySelectorAll('td')]
+      const mailTd = Array.from(document.querySelectorAll('td'))
         .find(td => /Mailing Address/i.test(td.textContent));
       if (mailTd?.nextElementSibling) {
         m = clean(mailTd.nextElementSibling.textContent);
@@ -106,23 +111,23 @@ async function fetchOwnerData(address) {
 
   } catch (err) {
     console.error('Scrape error:', err);
-    return { success:false, error:err.message };
+    return { success:false, error: err.message };
   } finally {
     await browser.close();
   }
 }
 
-// Define API endpoints
-app.post('/fulton-property-search', async (req,res) => {
-  const { address } = req.body||{};
+// API endpoints
+app.post('/fulton-property-search', async (req, res) => {
+  const { address } = req.body || {};
   if (!address) return res.status(400).json({ success:false, error:'address field required' });
   const data = await fetchOwnerData(address);
   res.json(data);
 });
 
-// Health & root routes
-app.get('/',    (req,res)=>res.send('Fulton Scraper API running'));
-app.get('/health',(req,res)=>res.json({ ok:true, ts:Date.now() }));
+// Root and health routes
+app.get('/',    (req, res) => res.send('Fulton Scraper API running'));
+app.get('/health',(req, res) => res.json({ ok:true, ts: Date.now() }));
 
-const PORT = process.env.PORT||8080;
-app.listen(PORT, ()=>console.log(`API listening on ${PORT}`));
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log(`API listening on port ${PORT}`));
