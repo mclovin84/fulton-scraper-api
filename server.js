@@ -1,8 +1,5 @@
 const express = require('express');
-const puppeteer = require('puppeteer-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-
-puppeteer.use(StealthPlugin());
+const puppeteer = require('puppeteer');
 
 const app = express();
 app.use(express.json());
@@ -27,92 +24,141 @@ function normalizeAddress(address) {
   return s.replace(/\s+/g,' ');
 }
 
+// Global browser instance to reuse
+let globalBrowser = null;
+
+async function getBrowser() {
+  if (!globalBrowser) {
+    globalBrowser = await puppeteer.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-extensions',
+        '--no-first-run',
+        '--disable-default-apps',
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding',
+        '--memory-pressure-off'
+      ]
+    });
+  }
+  return globalBrowser;
+}
+
 async function fetchOwnerData(address) {
-  const browser = await puppeteer.launch({
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu'
-    ]
-  });
-  const page = await browser.newPage();
-
+  let page = null;
+  const timeout = 30000; // 30 second timeout
+  
   try {
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-    await page.setViewport({ width: 1366, height: 768 });
-
+    const browser = await getBrowser();
+    page = await browser.newPage();
+    
+    // Set a smaller viewport to reduce memory usage
+    await page.setViewport({ width: 800, height: 600 });
+    
+    // Set timeout for all operations
+    page.setDefaultTimeout(timeout);
+    
     await page.goto(
       'https://qpublic.schneidercorp.com/Application.aspx?App=FultonCountyGA&PageType=Search',
-      { waitUntil: 'networkidle2', timeout: 60000 }
+      { waitUntil: 'domcontentloaded', timeout }
     );
 
     const title = await page.title();
     if (title.includes('Cloudflare') || title.includes('Attention')) {
-      throw new Error('Blocked by Cloudflare bot protection');
+      throw new Error('Blocked by Cloudflare - use n8n + Airtop workflow instead');
     }
 
     const norm = normalizeAddress(address);
-    const selectors = [
-      'input[name="txtSearchText"]',
-      'input[placeholder*="address"]',
-      'input[type="text"]'
-    ];
-    let inputEl = null;
-    for (const sel of selectors) {
-      inputEl = await page.$(sel);
-      if (inputEl) break;
-    }
-    if (!inputEl) {
-      throw new Error('Address input field not found');
-    }
-    await inputEl.click({ clickCount: 3 });
-    await inputEl.type(norm);
+    
+    // Simple input finding and filling
+    await page.waitForSelector('input[type="text"]', { timeout: 10000 });
+    await page.type('input[type="text"]', norm);
     await page.keyboard.press('Enter');
 
-    await page.waitForTimeout(5000);
+    await page.waitForTimeout(3000);
+    
+    // Try to click first result if available
     try {
-      await page.waitForSelector('table.searchResultsGrid a', { timeout: 10000 });
-      await page.click('table.searchResultsGrid tbody tr:first-child a');
-      await page.waitForTimeout(3000);
-    } catch {}
+      await page.waitForSelector('table a', { timeout: 5000 });
+      await page.click('table a');
+      await page.waitForTimeout(2000);
+    } catch (e) {
+      // No results found, continue
+    }
 
-    const { owner, mailing } = await page.evaluate(() => {
-      const clean = txt => (txt||'').replace(/\s+/g,' ').trim();
-      let owner = 'Not found', mailing = 'Not found';
-      const cells = Array.from(document.querySelectorAll('td'));
-      for (let i = 0; i < cells.length; i++) {
-        const txt = cells[i].textContent || '';
-        if (/Most Current Owner/i.test(txt) && cells[i+1]) {
-          owner = clean(cells[i+1].textContent);
+    // Extract data with timeout protection
+    const result = await Promise.race([
+      page.evaluate(() => {
+        const clean = txt => (txt||'').replace(/\s+/g,' ').trim();
+        let owner = 'Not found', mailing = 'Not found';
+        const cells = Array.from(document.querySelectorAll('td'));
+        for (let i = 0; i < cells.length; i++) {
+          const txt = cells[i].textContent || '';
+          if (/Most Current Owner/i.test(txt) && cells[i+1]) {
+            owner = clean(cells[i+1].textContent);
+          }
+          if (/Mailing Address/i.test(txt) && cells[i+1]) {
+            mailing = clean(cells[i+1].textContent);
+          }
         }
-        if (/Mailing Address/i.test(txt) && cells[i+1]) {
-          mailing = clean(cells[i+1].textContent);
-        }
-      }
-      return { owner, mailing };
-    });
+        return { owner, mailing };
+      }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Page evaluation timeout')), 10000))
+    ]);
 
-    return { success: true, owner_name: owner, mailing_address: mailing };
+    return { success: true, owner_name: result.owner, mailing_address: result.mailing };
+    
   } catch (err) {
+    console.error('Scraping error:', err.message);
     return { success: false, error: err.message };
   } finally {
-    await browser.close();
+    if (page) {
+      try {
+        await page.close();
+      } catch (e) {
+        console.error('Error closing page:', e.message);
+      }
+    }
   }
 }
+
+// Graceful shutdown handling
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, closing browser...');
+  if (globalBrowser) {
+    await globalBrowser.close();
+  }
+  process.exit(0);
+});
 
 app.post('/fulton-property-search', async (req, res) => {
   const { address } = req.body || {};
   if (!address) {
     return res.status(400).json({ success: false, error: 'address field required' });
   }
-  const data = await fetchOwnerData(address);
-  res.json(data);
+  
+  // Add request timeout
+  const timeoutId = setTimeout(() => {
+    res.status(408).json({ success: false, error: 'Request timeout' });
+  }, 25000);
+  
+  try {
+    const data = await fetchOwnerData(address);
+    clearTimeout(timeoutId);
+    res.json(data);
+  } catch (error) {
+    clearTimeout(timeoutId);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
 });
 
 app.get('/', (_, res) => res.send('Fulton Scraper API running'));
 app.get('/health', (_, res) => res.json({ ok: true, ts: Date.now() }));
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`API listening on port ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`API listening on port ${PORT}`));
