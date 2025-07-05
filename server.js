@@ -33,58 +33,94 @@ async function fetchOwnerData(address) {
   const page = await browser.newPage();
 
   try {
-    // 1) Navigate to search page
+    // Set viewport and user agent to ensure consistent rendering
+    await page.setViewport({ width: 1280, height: 800 });
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
+
+    // 1) Navigate to search page with longer timeout
+    console.log('Navigating to Fulton County search page...');
     await page.goto(
       'https://qpublic.schneidercorp.com/Application.aspx?App=FultonCountyGA&Layer=Parcels&PageType=Search',
-      { waitUntil: 'networkidle2', timeout: 30000 }
+      { waitUntil: 'networkidle0', timeout: 60000 }
     );
 
-    // 2) Accept terms if present
+    // 2) Wait a bit for any dynamic content to load
+    await page.waitForTimeout(3000);
+
+    // 3) Accept terms if present
     try {
       const agreeBtn = await page.$('input[type="button"][value*="Agree"], input[type="submit"][value*="Agree"]');
       if (agreeBtn) {
+        console.log('Accepting terms...');
         await agreeBtn.click();
         await page.waitForTimeout(2000);
       }
     } catch (e) {
-      // Continue if no agreement button
+      console.log('No terms to accept');
     }
 
-    // 3) Wait for the specific address input field using the ID you provided
-    await page.waitForSelector('#ctlBodyPane_ctl01_ctl01_txtAddress', { timeout: 10000 });
-    
-    // 4) Type the normalized address
+    // 4) Wait for the address input field to be visible and interactable
+    console.log('Waiting for address input field...');
+    await page.waitForSelector('#ctlBodyPane_ctl01_ctl01_txtAddress', { 
+      visible: true, 
+      timeout: 20000 
+    });
+
+    // Additional wait to ensure JavaScript has initialized
+    await page.waitForTimeout(1000);
+
+    // 5) Focus and clear the field first
+    await page.focus('#ctlBodyPane_ctl01_ctl01_txtAddress');
+    await page.evaluate(() => {
+      document.querySelector('#ctlBodyPane_ctl01_ctl01_txtAddress').value = '';
+    });
+
+    // 6) Type the normalized address
     const norm = normalizeAddress(address);
     console.log(`Typing normalized address: ${norm}`);
-    
-    await page.click('#ctlBodyPane_ctl01_ctl01_txtAddress', { clickCount: 3 });
-    await page.type('#ctlBodyPane_ctl01_ctl01_txtAddress', norm);
-    
-    // Small delay to let any autocomplete settle
-    await page.waitForTimeout(500);
+    await page.type('#ctlBodyPane_ctl01_ctl01_txtAddress', norm, { delay: 50 });
 
-    // 5) Click the search button using the ID from the onkeypress attribute
+    // 7) Small delay to let any autocomplete settle
+    await page.waitForTimeout(1000);
+
+    // 8) Click the search button
+    console.log('Clicking search button...');
     await page.click('#ctlBodyPane_ctl01_ctl01_btnSearch');
 
-    // 6) Wait for results table
-    await page.waitForSelector('table.searchResultsGrid a, table a[href*="KeyValue"]', { timeout: 15000 });
+    // 9) Wait for navigation or results to load
+    await Promise.race([
+      page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 30000 }),
+      page.waitForSelector('table.searchResultsGrid', { timeout: 30000 })
+    ]);
+
+    // 10) Wait for and click the first result
+    console.log('Waiting for search results...');
+    await page.waitForSelector('table.searchResultsGrid a', { timeout: 15000 });
     
-    // Click first result
-    const firstResult = await page.$('table.searchResultsGrid a, table a[href*="KeyValue"]');
+    // Get the first result link
+    const firstResult = await page.$('table.searchResultsGrid tbody tr:first-child a');
+    if (!firstResult) {
+      throw new Error('No search results found');
+    }
+    
     await firstResult.click();
 
-    // 7) Wait for the property details page to load
+    // 11) Wait for property details page
+    await page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 30000 });
+
+    // 12) Wait for owner information to load
+    console.log('Extracting owner information...');
     await page.waitForFunction(
       () => {
-        const text = document.body.innerText;
+        const text = document.body.innerText || '';
         return text.includes('Most Current Owner') || text.includes('Owner Name') || text.includes('Current Owner');
       },
       { timeout: 15000 }
     );
 
-    // 8) Extract owner & mailing address
+    // 13) Extract owner & mailing address
     const result = await page.evaluate(() => {
-      const clean = txt => txt.replace(/\s+/g, ' ').trim();
+      const clean = txt => (txt || '').replace(/\s+/g, ' ').trim();
       let owner = 'Not found';
       let mailing = 'Not found';
       
@@ -96,7 +132,6 @@ async function fetchOwnerData(address) {
         
         // Look for owner
         if (/Most Current Owner/i.test(cellText)) {
-          // The owner name is typically in the next cell
           if (cells[i + 1]) {
             owner = clean(cells[i + 1].textContent);
           } else if (cells[i].nextElementSibling) {
@@ -106,7 +141,6 @@ async function fetchOwnerData(address) {
         
         // Look for mailing address
         if (/Mailing Address/i.test(cellText)) {
-          // The mailing address is typically in the next cell
           if (cells[i + 1]) {
             mailing = clean(cells[i + 1].textContent);
           } else if (cells[i].nextElementSibling) {
@@ -118,6 +152,7 @@ async function fetchOwnerData(address) {
       return { owner, mailing };
     });
 
+    console.log('Successfully extracted data');
     return {
       success: true,
       owner_name: result.owner,
@@ -125,7 +160,16 @@ async function fetchOwnerData(address) {
     };
 
   } catch (err) {
-    console.error('Scrape error:', err);
+    console.error('Scrape error:', err.message);
+    
+    // Try to get current page URL for debugging
+    try {
+      const currentUrl = page.url();
+      console.error('Current page URL:', currentUrl);
+    } catch (e) {
+      // Ignore if we can't get URL
+    }
+    
     return { success: false, error: err.message };
   } finally {
     await browser.close();
@@ -138,7 +182,7 @@ app.post('/fulton-property-search', async (req, res) => {
   if (!address) {
     return res.status(400).json({ success: false, error: 'address field required' });
   }
-  console.log(`Searching for address: ${address}`);
+  console.log(`Received request for address: ${address}`);
   const data = await fetchOwnerData(address);
   res.json(data);
 });
