@@ -30,97 +30,92 @@ async function fetchOwnerData(address) {
   const browser = await puppeteer.connect({
     browserWSEndpoint: process.env.BROWSER_WS_ENDPOINT
   });
+  
   const page = await browser.newPage();
+  
+  // Set user agent to appear more like a real browser
+  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+  
+  // Set viewport
+  await page.setViewport({ width: 1366, height: 768 });
+  
+  // Add extra headers
+  await page.setExtraHTTPHeaders({
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1'
+  });
 
   try {
-    console.log('Step 1: Navigating to search page...');
+    console.log('Navigating to search page...');
+    
+    // First, try to visit the main site to get cookies
+    await page.goto('https://qpublic.schneidercorp.com/', { 
+      waitUntil: 'networkidle2', 
+      timeout: 30000 
+    });
+    
+    await page.waitForTimeout(2000);
+    
+    // Now navigate to the search page
     await page.goto(
       'https://qpublic.schneidercorp.com/Application.aspx?App=FultonCountyGA&PageType=Search',
       { waitUntil: 'networkidle2', timeout: 30000 }
     );
 
-    console.log('Step 2: Current URL:', page.url());
+    console.log('Current URL:', page.url());
+    console.log('Page title:', await page.title());
     
-    // Check if we need to accept terms
-    const pageContent = await page.content();
-    if (pageContent.includes('Agree') || pageContent.includes('Accept')) {
-      console.log('Step 3: Found terms, accepting...');
-      try {
-        await page.click('input[value*="Agree"]');
-        await page.waitForTimeout(3000);
-        console.log('Terms accepted, new URL:', page.url());
-      } catch (e) {
-        console.log('Could not click agree button');
+    // Check if we're blocked by Cloudflare
+    const title = await page.title();
+    if (title.includes('Cloudflare') || title.includes('Attention')) {
+      console.log('Detected Cloudflare challenge');
+      
+      // Wait longer for potential auto-redirect
+      await page.waitForTimeout(10000);
+      
+      // Check if we've been redirected
+      const newUrl = page.url();
+      const newTitle = await page.title();
+      console.log('After wait - URL:', newUrl);
+      console.log('After wait - Title:', newTitle);
+      
+      if (newTitle.includes('Cloudflare')) {
+        throw new Error('Blocked by Cloudflare bot protection');
       }
     }
-
-    // Debug: Check what's on the page
-    const inputs = await page.evaluate(() => {
-      return Array.from(document.querySelectorAll('input[type="text"]')).map(input => ({
-        id: input.id,
-        name: input.name,
-        placeholder: input.placeholder,
-        visible: window.getComputedStyle(input).display !== 'none'
-      }));
-    });
-    console.log('Available text inputs:', JSON.stringify(inputs, null, 2));
-
-    // Try different ways to find the address input
-    let addressInput = null;
     
-    // Method 1: Direct ID
-    try {
-      addressInput = await page.$('#ctlBodyPane_ctl01_ctl01_txtAddress');
-      if (addressInput) console.log('Found input by ID');
-    } catch (e) {}
-
-    // Method 2: Find by placeholder
-    if (!addressInput) {
-      addressInput = await page.evaluateHandle(() => {
-        const inputs = document.querySelectorAll('input[type="text"]');
-        for (const input of inputs) {
-          if (input.placeholder && input.placeholder.toLowerCase().includes('address')) {
-            return input;
-          }
-        }
-        return null;
-      });
-      if (addressInput) console.log('Found input by placeholder');
-    }
-
-    if (!addressInput) {
-      throw new Error('Could not find address input field');
-    }
-
-    // Type the address
+    // Continue with the search...
     const norm = normalizeAddress(address);
-    console.log('Typing address:', norm);
+    console.log('Normalized address:', norm);
     
-    await page.evaluate((input, text) => {
-      input.focus();
-      input.value = text;
-    }, addressInput, norm);
-
-    // Trigger search
+    // Wait for page to fully load
+    await page.waitForTimeout(3000);
+    
+    // Try to find and fill the address input
+    const addressInput = await page.$('#ctlBodyPane_ctl01_ctl01_txtAddress');
+    if (!addressInput) {
+      throw new Error('Address input field not found');
+    }
+    
+    await addressInput.click();
+    await page.keyboard.type(norm);
     await page.keyboard.press('Enter');
     
-    console.log('Waiting for results...');
+    // Wait for results
     await page.waitForTimeout(5000);
-
-    // Check if we're on results page or property page
-    const currentUrl = page.url();
-    console.log('After search URL:', currentUrl);
-
-    // Try to click first result
+    
+    // Check for results
     try {
       await page.waitForSelector('table.searchResultsGrid a', { timeout: 5000 });
-      console.log('Found results table, clicking first result...');
       await page.click('table.searchResultsGrid tbody tr:first-child a');
       await page.waitForTimeout(3000);
     } catch (e) {
-      console.log('No results table found, checking if already on property page');
+      console.log('No results table found');
     }
-
+    
     // Extract owner info
     const result = await page.evaluate(() => {
       const clean = txt => (txt || '').replace(/\s+/g, ' ').trim();
@@ -144,8 +139,6 @@ async function fetchOwnerData(address) {
       return { owner, mailing };
     });
 
-    console.log('Extracted data:', result);
-
     return {
       success: true,
       owner_name: result.owner,
@@ -153,17 +146,7 @@ async function fetchOwnerData(address) {
     };
 
   } catch (err) {
-    console.error('Error details:', err);
-    
-    // Get current page state for debugging
-    try {
-      const debugInfo = {
-        url: page.url(),
-        title: await page.title()
-      };
-      console.error('Page debug info:', debugInfo);
-    } catch (e) {}
-    
+    console.error('Error:', err.message);
     return { success: false, error: err.message };
   } finally {
     await browser.close();
@@ -176,7 +159,6 @@ app.post('/fulton-property-search', async (req, res) => {
   if (!address) {
     return res.status(400).json({ success: false, error: 'address field required' });
   }
-  console.log(`Searching for address: ${address}`);
   const data = await fetchOwnerData(address);
   res.json(data);
 });
