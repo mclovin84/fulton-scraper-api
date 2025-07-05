@@ -1,6 +1,6 @@
 // server.js – Fulton County Property Owner Lookup API
 
-const express   = require('express');
+const express = require('express');
 const puppeteer = require('puppeteer-core');
 
 const app = express();
@@ -46,72 +46,109 @@ async function fetchOwnerData(address) {
       { waitUntil:'networkidle2', timeout:30000 }
     );
 
-    // 2) Click “Accept” or “Agree” if present
-    try {
-      const btn = await page.$('input[type="submit"][value*="Accept"], input[type="button"][value*="Agree"]');
-      if (btn) {
-        await btn.click();
-        await page.waitForTimeout(1000);
-      } else {
-        const [xpathBtn] = await page.$x("//button[contains(text(),'Agree') or contains(text(),'Accept')]");
-        if (xpathBtn) {
-          await xpathBtn.click();
-          await page.waitForTimeout(1000);
+    // 2) Wait for page to fully load
+    await page.waitForTimeout(3000);
+
+    // 3) Find the "Search by Location Address" input field
+    // Based on current site structure, we need to find the address input under the "Search by Location Address" section
+    const addressInputSelector = 'input[type="text"]';
+    await page.waitForSelector(addressInputSelector, { timeout: 10000 });
+
+    // Get all text inputs and find the one for address search
+    const addressInput = await page.evaluate(() => {
+      const inputs = document.querySelectorAll('input[type="text"]');
+      // Look for the input that's in the "Search by Location Address" section
+      for (let input of inputs) {
+        const parentText = input.closest('div, section, form')?.textContent || '';
+        if (parentText.includes('Location Address') || parentText.includes('Enter address')) {
+          return input;
         }
       }
-    } catch (e) {
-      console.log('No Accept/Agree button found');
-    }
+      // Fallback to second input (usually the address one based on page structure)
+      return inputs[1] || inputs[0];
+    });
 
-    // 3) Wait for search input (new placeholder or old ID)
-    let selector = 'input[placeholder*="Enter address"]';
-    if (!await page.$(selector)) {
-      selector = '#SearchTextBox';
+    if (!addressInput) {
+      throw new Error('Could not find address input field');
     }
-    await page.waitForSelector(selector, { timeout:10000 });
 
     // 4) Type normalized address
     const norm = normalizeAddress(address);
-    await page.click(selector, { clickCount: 3 });
-    await page.type(selector, norm);
+    console.log(`Searching for normalized address: ${norm}`);
+    
+    await page.evaluate((selector, value) => {
+      const inputs = document.querySelectorAll('input[type="text"]');
+      const input = inputs[1] || inputs[0]; // Usually second input is address
+      if (input) {
+        input.value = '';
+        input.focus();
+        input.value = value;
+      }
+    }, addressInputSelector, norm);
 
-    // 5) Submit search
-    const searchBtn = await page.$('input[type="submit"][value="Search"], button:has-text("Search")');
-    if (searchBtn) {
-      await searchBtn.click();
-    } else {
-      await page.keyboard.press('Enter');
-    }
+    // 5) Find and click the corresponding Search button
+    await page.evaluate(() => {
+      const buttons = document.querySelectorAll('input[type="submit"], button');
+      for (let button of buttons) {
+        const buttonText = button.value || button.textContent || '';
+        const parentText = button.closest('div, section, form')?.textContent || '';
+        if ((buttonText.includes('Search') || button.type === 'submit') && 
+            parentText.includes('Location Address')) {
+          button.click();
+          return;
+        }
+      }
+      // Fallback - click any search button
+      const searchBtn = [...buttons].find(btn => 
+        (btn.value && btn.value.includes('Search')) || 
+        (btn.textContent && btn.textContent.includes('Search'))
+      );
+      if (searchBtn) searchBtn.click();
+    });
 
-    // 6) Wait for results and open first parcel
-    await page.waitForSelector('table.searchResultsGrid a', { timeout:15000 });
-    await page.click('table.searchResultsGrid a');
+    // 6) Wait for results and click first parcel
+    await page.waitForSelector('table a, .searchResultsGrid a', { timeout: 15000 });
+    await page.click('table a, .searchResultsGrid a');
 
-    // 7) Wait for owner info section
-    await page.waitForSelector('td:has-text("Most Current Owner")', { timeout:15000 });
+    // 7) Wait for property details page
+    await page.waitForTimeout(5000);
 
     // 8) Extract owner & mailing address
     const { owner, mailing } = await page.evaluate(() => {
       const clean = txt => txt.replace(/\s+/g,' ').trim();
       let o='Not found', m='Not found';
-      const ownerTd = Array.from(document.querySelectorAll('td'))
-        .find(td => /Most Current Owner/i.test(td.textContent));
-      if (ownerTd?.nextElementSibling) {
-        o = clean(ownerTd.nextElementSibling.textContent);
+      
+      // Look for owner information in table cells
+      const allCells = document.querySelectorAll('td, th, div');
+      
+      for (let cell of allCells) {
+        const text = cell.textContent || '';
+        
+        // Look for "Owner" or "Current Owner" labels
+        if (/Owner/i.test(text) && !text.includes('Mailing')) {
+          const nextCell = cell.nextElementSibling;
+          if (nextCell && nextCell.textContent.trim()) {
+            o = clean(nextCell.textContent);
+          }
+        }
+        
+        // Look for "Mailing Address" labels
+        if (/Mailing.*Address/i.test(text)) {
+          const nextCell = cell.nextElementSibling;
+          if (nextCell && nextCell.textContent.trim()) {
+            m = clean(nextCell.textContent);
+          }
+        }
       }
-      const mailTd = Array.from(document.querySelectorAll('td'))
-        .find(td => /Mailing Address/i.test(td.textContent));
-      if (mailTd?.nextElementSibling) {
-        m = clean(mailTd.nextElementSibling.textContent);
-      }
-      return { owner:o, mailing:m };
+      
+      return { owner: o, mailing: m };
     });
 
-    return { success:true, owner_name:owner, mailing_address:mailing };
+    return { success: true, owner_name: owner, mailing_address: mailing };
 
   } catch (err) {
     console.error('Scrape error:', err);
-    return { success:false, error: err.message };
+    return { success: false, error: err.message };
   } finally {
     await browser.close();
   }
@@ -120,14 +157,14 @@ async function fetchOwnerData(address) {
 // API endpoints
 app.post('/fulton-property-search', async (req, res) => {
   const { address } = req.body || {};
-  if (!address) return res.status(400).json({ success:false, error:'address field required' });
+  if (!address) return res.status(400).json({ success: false, error: 'address field required' });
   const data = await fetchOwnerData(address);
   res.json(data);
 });
 
 // Root and health routes
-app.get('/',    (req, res) => res.send('Fulton Scraper API running'));
-app.get('/health',(req, res) => res.json({ ok:true, ts: Date.now() }));
+app.get('/', (req, res) => res.send('Fulton Scraper API running'));
+app.get('/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`API listening on port ${PORT}`));
