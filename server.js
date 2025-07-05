@@ -1,184 +1,130 @@
+// server.js – Fulton County Property Owner Lookup API
+
 const express = require('express');
 const puppeteer = require('puppeteer-core');
 
 const app = express();
 app.use(express.json());
 
+/**
+ * Normalize a street address by uppercasing, removing punctuation,
+ * mapping long forms to USPS abbreviations, and stripping city/state/zip.
+ */
 function normalizeAddress(address) {
-    const ABBREVIATIONS = {
-        'STREET': 'ST', 'AVENUE': 'AVE', 'BOULEVARD': 'BLVD',
-        'DRIVE': 'DR', 'ROAD': 'RD', 'LANE': 'LN', 'COURT': 'CT',
-        'CIRCLE': 'CIR', 'PLACE': 'PL', 'PARKWAY': 'PKWY',
-        'MARTIN LUTHER KING JR': 'M L KING JR',
-        'MARTIN LUTHER KING': 'M L KING',
-        'MLK': 'M L KING',
-        'NORTH': 'N', 'SOUTH': 'S', 'EAST': 'E', 'WEST': 'W',
-        'NORTHEAST': 'NE', 'NORTHWEST': 'NW', 'SOUTHEAST': 'SE', 'SOUTHWEST': 'SW'
-    };
-    
-    let normalized = address.toUpperCase().replace(/[.,#]/g, '');
-    
-    for (const [longForm, abbr] of Object.entries(ABBREVIATIONS)) {
-        const escapedLongForm = longForm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const regex = new RegExp('\\b' + escapedLongForm + '\\b', 'g');
-        normalized = normalized.replace(regex, abbr);
-    }
-    
-    const parts = normalized.split(' ');
-    const filteredParts = [];
-    
-    for (let i = 0; i < parts.length; i++) {
-        const part = parts[i];
-        if (['ATLANTA', 'AUGUSTA', 'COLUMBUS', 'MACON', 'SAVANNAH', 'ATHENS', 'GA', 'GEORGIA'].includes(part)) {
-            break;
-        }
-        if (/^\d{5}(-\d{4})?$/.test(part)) {
-            break;
-        }
-        if (part.trim()) {
-            filteredParts.push(part);
-        }
-    }
-    
-    return filteredParts.join(' ').trim();
+  const ABBREVIATIONS = {
+    STREET: 'ST', AVENUE: 'AVE', BOULEVARD: 'BLVD', DRIVE: 'DR',
+    ROAD: 'RD', LANE: 'LN', COURT: 'CT', CIRCLE: 'CIR',
+    PLACE: 'PL', PARKWAY: 'PKWY', TRAIL: 'TRL', TERRACE: 'TER',
+    PLAZA: 'PLZ', ALLEY: 'ALY', BRIDGE: 'BRG', BYPASS: 'BYP',
+    CAUSEWAY: 'CSWY', CENTER: 'CTR', CENTRE: 'CTR', CROSSING: 'XING',
+    EXPRESSWAY: 'EXPY', EXTENSION: 'EXT', FREEWAY: 'FWY', GROVE: 'GRV',
+    HEIGHTS: 'HTS', HIGHWAY: 'HWY', HOLLOW: 'HOLW', JUNCTION: 'JCT',
+    MOTORWAY: 'MTWY', SKWY: 'SKWY', SQUARE: 'SQ', TURNPIKE: 'TPKE',
+    NORTH: 'N', SOUTH: 'S', EAST: 'E', WEST: 'W',
+    NORTHEAST: 'NE', NORTHWEST: 'NW', SOUTHEAST: 'SE', SOUTHWEST: 'SW',
+    'MARTIN LUTHER KING JR': 'M L KING JR',
+    'MARTIN LUTHER KING': 'M L KING', MLK: 'M L KING',
+  };
+
+  let s = address.toUpperCase().replace(/[.,#]/g, ' ');
+  for (const [longForm, abbr] of Object.entries(ABBREVIATIONS)) {
+    const re = new RegExp(`\\b${longForm}\\b`, 'g');
+    s = s.replace(re, abbr);
+  }
+  // remove trailing city/state/zip
+  s = s.replace(/\b(ATLANTA|AUGUSTA|COLUMBUS|MACON|SAVANNAH|ATHENS|GA|GEORGIA)\b.*$/, '').trim();
+  return s.replace(/\s+/g, ' ');
 }
 
-async function scrapeFultonProperty(address) {
-    const browser = await puppeteer.connect({
-        browserWSEndpoint: process.env.BROWSER_WS_ENDPOINT
+/**
+ * Scrape Fulton County site for owner name and mailing address.
+ */
+async function fetchOwnerData(address) {
+  const browser = await puppeteer.connect({
+    browserWSEndpoint: process.env.BROWSER_WS_ENDPOINT
+  });
+  const page = await browser.newPage();
+
+  try {
+    // 1. Navigate to search page
+    await page.goto(
+      'https://qpublic.schneidercorp.com/Application.aspx?App=FultonCountyGA&Layer=Parcels&PageType=Search',
+      { waitUntil: 'networkidle2', timeout: 30000 }
+    );
+
+    // 2. Accept terms if present
+    const agree = await page.$('input[value*="agree" i], button:contains("Agree")');
+    if (agree) await agree.click();
+
+    // 3. Wait a moment for page to settle
+    await page.waitForTimeout(2000);
+
+    // 4. Locate the “Search by Location Address” input
+    let selector = 'input[placeholder*="Enter address"]';
+    if (!await page.$(selector)) {
+      selector = '#SearchTextBox';
+    }
+    await page.waitForSelector(selector, { timeout: 10000 });
+    const street = normalizeAddress(address);
+    await page.click(selector, { clickCount: 3 });
+    await page.type(selector, street);
+
+    // 5. Submit the search
+    const btn = await page.$('input[value="Search"], button:contains("Search")');
+    if (btn) {
+      await btn.click();
+    } else {
+      await page.keyboard.press('Enter');
+    }
+
+    // 6. Wait for results link and click first result
+    await page.waitForSelector('table.searchResultsGrid a', { timeout: 15000 });
+    await page.click('table.searchResultsGrid a');
+
+    // 7. Wait for owner section
+    await page.waitForSelector('td:contains("Most Current Owner")', { timeout: 15000 });
+
+    // 8. Extract owner & mailing address
+    const data = await page.evaluate(() => {
+      const clean = txt => txt.replace(/\s+/g, ' ').trim();
+      let owner = 'Not found', mailing = 'Not found';
+
+      // Owner
+      const ownerLabel = Array.from(document.querySelectorAll('td'))
+        .find(td => /Most Current Owner/i.test(td.textContent));
+      if (ownerLabel && ownerLabel.nextElementSibling) {
+        owner = clean(ownerLabel.nextElementSibling.textContent);
+      }
+
+      // Mailing
+      const mailLabel = Array.from(document.querySelectorAll('td'))
+        .find(td => /Mailing Address/i.test(td.textContent));
+      if (mailLabel && mailLabel.nextElementSibling) {
+        mailing = clean(mailLabel.nextElementSibling.textContent);
+      }
+
+      return { owner, mailing };
     });
-    
-    try {
-        const page = await browser.newPage();
-        
-        // Navigate to the updated Fulton County search page
-        await page.goto('https://qpublic.schneidercorp.com/Application.aspx?App=FultonCountyGA&Layer=Parcels&PageType=Search', {
-            waitUntil: 'networkidle2',
-            timeout: 30000
-        });
-        
-        // Wait for the page to load completely
-        await page.waitForTimeout(3000);
-        
-        // Look for the address search input field (updated selector)
-        // Based on the new structure, we need to find the location address input
-        const addressInputSelector = 'input[placeholder*="address"], input[type="text"][name*="address"], input[type="text"][id*="address"]';
-        
-        try {
-            await page.waitForSelector(addressInputSelector, { timeout: 10000 });
-        } catch (error) {
-            // If specific selector fails, try more general approach
-            await page.waitForSelector('input[type="text"]', { timeout: 10000 });
-        }
-        
-        const normalizedAddress = normalizeAddress(address);
-        console.log(`Normalized address: ${normalizedAddress}`);
-        
-        // Try to find and fill the address input field
-        const addressInput = await page.$('input[type="text"]');
-        if (addressInput) {
-            await addressInput.click();
-            await addressInput.type(normalizedAddress);
-            
-            // Look for and click the search button
-            const searchButton = await page.$('button[type="submit"], input[type="submit"], button:contains("Search")');
-            if (searchButton) {
-                await searchButton.click();
-            } else {
-                // If no button found, try pressing Enter
-                await addressInput.press('Enter');
-            }
-        }
-        
-        // Wait for results page
-        await page.waitForTimeout(5000);
-        
-        // Look for property results and extract owner information
-        const ownerData = await page.evaluate(() => {
-            // Look for owner information in various possible locations
-            const textContent = document.body.textContent;
-            
-            // Try to find owner name patterns
-            let ownerName = 'Not found';
-            let mailingAddress = 'Not found';
-            
-            // Look for "Owner" or "Current Owner" sections
-            const ownerElements = document.querySelectorAll('*');
-            for (let element of ownerElements) {
-                const text = element.textContent;
-                if (text && (text.includes('Owner') || text.includes('OWNER'))) {
-                    const parent = element.closest('table, div, section, tr');
-                    if (parent) {
-                        const parentText = parent.textContent;
-                        // Extract owner information from parent element
-                        const lines = parentText.split('\n').map(line => line.trim()).filter(line => line);
-                        if (lines.length > 0) {
-                            ownerName = lines[0];
-                            if (lines.length > 1) {
-                                mailingAddress = lines.slice(1).join(', ');
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
-            
-            return { owner_name: ownerName, mailing_address: mailingAddress };
-        });
-        
-        return {
-            success: true,
-            owner_name: ownerData.owner_name,
-            mailing_address: ownerData.mailing_address
-        };
-        
-    } catch (error) {
-        console.error('Scraping error:', error);
-        return {
-            success: false,
-            error: error.message,
-            owner_name: 'Error occurred',
-            mailing_address: 'Error occurred'
-        };
-    } finally {
-        await browser.close();
-    }
+
+    return { success: true, owner_name: data.owner, mailing_address: data.mailing };
+  } catch (err) {
+    console.error('Scrape error:', err);
+    return { success: false, error: err.message };
+  } finally {
+    await browser.close();
+  }
 }
 
+// API endpoints
 app.post('/fulton-property-search', async (req, res) => {
-    try {
-        const { address } = req.body;
-        
-        if (!address) {
-            return res.status(400).json({ 
-                success: false, 
-                error: 'Address is required' 
-            });
-        }
-        
-        console.log(`Processing address: ${address}`);
-        const result = await scrapeFultonProperty(address);
-        
-        res.json(result);
-        
-    } catch (error) {
-        console.error('API error:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
+  const { address } = req.body || {};
+  if (!address) return res.status(400).json({ success: false, error: 'address field required' });
+  const result = await fetchOwnerData(address);
+  res.json(result);
 });
 
-app.get('/', (req, res) => {
-    res.send('Fulton Scraper API is running!');
-});
-
-app.get('/health', (req, res) => {
-    res.json({ status: 'OK', timestamp: new Date().toISOString() });
-});
+app.get('/', (req, res) => res.send('Fulton Scraper API is running'));
+app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: Date.now() }));
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-    console.log(`Fulton County scraper running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`API listening on port ${PORT}`));
