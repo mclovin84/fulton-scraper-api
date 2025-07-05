@@ -7,13 +7,23 @@ const app = express();
 app.use(express.json());
 
 function normalizeAddress(address) {
-  // (same abbreviation logic as before)
-  const ABBREV = {/* … USPS mappings … */};
+  // Same USPS abbreviation mapping as before
+  const ABBREV = {
+    'STREET':'ST','AVENUE':'AVE','BOULEVARD':'BLVD','DRIVE':'DR',
+    'ROAD':'RD','LANE':'LN','COURT':'CT','CIRCLE':'CIR','PLACE':'PL',
+    'PARKWAY':'PKWY','TRAIL':'TRL','TERRACE':'TER','PLAZA':'PLZ',
+    'ALLEY':'ALY','BRIDGE':'BRG','BYPASS':'BYP','CAUSEWAY':'CSWY',
+    'CENTER':'CTR','CROSSING':'XING','EXPRESSWAY':'EXPY','EXTENSION':'EXT',
+    'FREEWAY':'FWY','HEIGHTS':'HTS','HIGHWAY':'HWY','JUNCTION':'JCT',
+    'NORTH':'N','SOUTH':'S','EAST':'E','WEST':'W','MLK':'M L KING'
+  };
   let s = address.toUpperCase().replace(/[.,#]/g,' ');
   for (const [k,v] of Object.entries(ABBREV)) {
     s = s.replace(new RegExp(`\\b${k}\\b`,'g'), v);
   }
-  return s.replace(/\b(ATLANTA|AUGUSTA|COLUMBUS|MACON|SAVANNAH|ATHENS|GA|GEORGIA)\b.*$/,'').trim();
+  // Strip trailing city/state/zip
+  s = s.replace(/\b(ATLANTA|GA|GEORGIA)\b.*$/,'').trim();
+  return s.replace(/\s+/g,' ');
 }
 
 async function fetchOwnerData(address) {
@@ -23,68 +33,69 @@ async function fetchOwnerData(address) {
   const page = await browser.newPage();
 
   try {
+    // 1) Load the search page
     await page.goto(
       'https://qpublic.schneidercorp.com/Application.aspx?App=FultonCountyGA&Layer=Parcels&PageType=Search',
       { waitUntil:'networkidle2', timeout:30000 }
     );
 
-    // Accept terms if present
-    const [agree] = await page.$x("//input[contains(@value,'Agree') or contains(@value,'Accept')]");
-    if (agree) {
-      await agree.click();
+    // 2) Accept terms if they appear
+    const agreeBtn = await page.$('input[type=button][value*="Agree"], input[type=submit][value*="Agree"]');
+    if (agreeBtn) {
+      await agreeBtn.click();
       await page.waitForTimeout(1000);
     }
 
-    // 1) Locate the "Search by Location Address" label and get its following input
-    const [label] = await page.$x("//label[contains(., 'Search by Location Address')]");
-    if (!label) throw new Error('Address label not found');
-    const inputHandle = await page.evaluateHandle(el => el.nextElementSibling.querySelector('input'), label);
-    if (!inputHandle) throw new Error('Address input not found');
-
-    // 2) Type normalized address
+    // 3) Normalize and split into number + street name
     const norm = normalizeAddress(address);
-    await inputHandle.click({ clickCount: 3 });
-    await inputHandle.type(norm);
+    const parts = norm.split(' ');
+    const streetNumber = parts.shift();
+    const streetName   = parts.join(' ');
 
-    // 3) Click the Search button near that input
-    const [searchBtn] = await page.$x("//button[contains(., 'Search') or //input[@value='Search']]");
-    if (searchBtn) {
-      await searchBtn.click();
-    } else {
-      await page.keyboard.press('Enter');
-    }
+    // 4) Fill Street Number
+    await page.waitForSelector('input[name="txtStreetNumber"]',{ timeout:10000 });
+    await page.click('input[name="txtStreetNumber"]',{ clickCount:3 });
+    await page.type('input[name="txtStreetNumber"]', streetNumber);
 
-    // 4) Wait for results and click first link
-    await page.waitForXPath("//table[contains(@class,'searchResultsGrid')]//a", { timeout:15000 });
-    const [firstLink] = await page.$x("//table[contains(@class,'searchResultsGrid')]//a");
-    await firstLink.click();
+    // 5) Fill Street Name
+    await page.waitForSelector('input[name="txtStreetName"]',{ timeout:10000 });
+    await page.click('input[name="txtStreetName"]',{ clickCount:3 });
+    await page.type('input[name="txtStreetName"]', streetName);
 
-    // 5) Wait for owner section
-    await page.waitForXPath("//td[contains(., 'Most Current Owner')]", { timeout:15000 });
+    // 6) Click Search
+    await page.click('input[type=submit][value="Search"]');
 
-    // 6) Scrape owner & mailing
+    // 7) Wait for and click first result link
+    await page.waitForSelector('table.searchResultsGrid a',{ timeout:15000 });
+    await page.click('table.searchResultsGrid a');
+
+    // 8) Wait for “Most Current Owner”
+    await page.waitForXPath("//td[contains(.,'Most Current Owner')]",{ timeout:15000 });
+
+    // 9) Extract owner & mailing
     const result = await page.evaluate(() => {
-      const clean = t => t.replace(/\s+/g,' ').trim();
-      const cells = Array.from(document.querySelectorAll('td'));
-      let owner='Not found', mailing='Not found';
-      for (const td of cells) {
+      const clean = txt => txt.replace(/\s+/g,' ').trim();
+      const tds = Array.from(document.querySelectorAll('td'));
+      let owner='Not found', mail='Not found';
+      for (const td of tds) {
         if (/Most Current Owner/i.test(td.textContent) && td.nextElementSibling) {
           owner = clean(td.nextElementSibling.textContent);
         }
         if (/Mailing Address/i.test(td.textContent) && td.nextElementSibling) {
-          mailing = clean(td.nextElementSibling.textContent);
+          mail = clean(td.nextElementSibling.textContent);
         }
       }
-      return { owner, mailing };
+      return { owner, mail };
     });
 
     return {
       success: true,
-      owner_name: result.owner,
-      mailing_address: result.mailing
+      owner_name:  result.owner,
+      mailing_address: result.mail
     };
+
   } catch (err) {
-    console.error('Scrape error:', err);
+    console.error('Error scraping:', err);
     return { success: false, error: err.message };
   } finally {
     await browser.close();
@@ -93,13 +104,15 @@ async function fetchOwnerData(address) {
 
 app.post('/fulton-property-search', async (req, res) => {
   const { address } = req.body || {};
-  if (!address) return res.status(400).json({ success: false, error: 'address required' });
-  res.json(await fetchOwnerData(address));
+  if (!address) {
+    return res.status(400).json({ success:false, error:'address field required' });
+  }
+  const data = await fetchOwnerData(address);
+  res.json(data);
 });
 
 app.get('/',      (_,res) => res.send('Fulton Scraper API running'));
 app.get('/health',(_,res) => res.json({ ok:true, ts: Date.now() }));
 
-app.listen(process.env.PORT || 8080, () => {
-  console.log('API listening');
-});
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log(`API listening on port ${PORT}`));
