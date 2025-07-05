@@ -1,7 +1,5 @@
-// server.js – Fulton County Property Owner Lookup API
-
 const express = require('express');
-const { connect } = require('puppeteer-real-browser');
+const puppeteer = require('puppeteer');
 
 const app = express();
 app.use(express.json());
@@ -27,12 +25,8 @@ function normalizeAddress(address) {
 }
 
 async function fetchOwnerData(address) {
-  // Launch a real browser in headless mode without Xvfb
-  const { browser, page } = await connect({
+  const browser = await puppeteer.launch({
     headless: true,
-    disableXvfb: true,
-    fingerprint: true,
-    turnstile: true,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -40,21 +34,22 @@ async function fetchOwnerData(address) {
       '--disable-gpu'
     ]
   });
+  const page = await browser.newPage();
 
   try {
-    // Navigate to the search page
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+    await page.setViewport({ width: 1366, height: 768 });
+
     await page.goto(
       'https://qpublic.schneidercorp.com/Application.aspx?App=FultonCountyGA&PageType=Search',
       { waitUntil: 'networkidle2', timeout: 60000 }
     );
 
-    // Detect Cloudflare block
     const title = await page.title();
     if (title.includes('Cloudflare') || title.includes('Attention')) {
       throw new Error('Blocked by Cloudflare bot protection');
     }
 
-    // Normalize and input address
     const norm = normalizeAddress(address);
     const selectors = [
       'input[name="txtSearchText"]',
@@ -73,7 +68,6 @@ async function fetchOwnerData(address) {
     await inputEl.type(norm);
     await page.keyboard.press('Enter');
 
-    // Wait for results and click first link
     await page.waitForTimeout(5000);
     try {
       await page.waitForSelector('table.searchResultsGrid a', { timeout: 10000 });
@@ -81,7 +75,6 @@ async function fetchOwnerData(address) {
       await page.waitForTimeout(3000);
     } catch {}
 
-    // Extract owner & mailing info
     const { owner, mailing } = await page.evaluate(() => {
       const clean = txt => (txt||'').replace(/\s+/g,' ').trim();
       let owner = 'Not found', mailing = 'Not found';
