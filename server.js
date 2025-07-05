@@ -41,7 +41,7 @@ async function fetchOwnerData(address) {
 
     // 2) Accept terms if present
     try {
-      const agreeBtn = await page.$('input[type="button"][value*="Agree"], input[type="submit"][value*="Agree"], button:has-text("Accept"), button:has-text("Agree")');
+      const agreeBtn = await page.$('input[type="button"][value*="Agree"], input[type="submit"][value*="Agree"]');
       if (agreeBtn) {
         await agreeBtn.click();
         await page.waitForTimeout(2000);
@@ -50,150 +50,30 @@ async function fetchOwnerData(address) {
       // Continue if no agreement button
     }
 
-    // 3) Debug: Log what's on the page
-    console.log('Page loaded, looking for input fields...');
+    // 3) Wait for the specific address input field using the ID you provided
+    await page.waitForSelector('#ctlBodyPane_ctl01_ctl01_txtAddress', { timeout: 10000 });
     
-    // 4) Try multiple strategies to find the address input
+    // 4) Type the normalized address
     const norm = normalizeAddress(address);
-    let inputFound = false;
+    console.log(`Typing normalized address: ${norm}`);
+    
+    await page.click('#ctlBodyPane_ctl01_ctl01_txtAddress', { clickCount: 3 });
+    await page.type('#ctlBodyPane_ctl01_ctl01_txtAddress', norm);
+    
+    // Small delay to let any autocomplete settle
+    await page.waitForTimeout(500);
 
-    // Strategy 1: Try finding a single address input field
-    const singleAddressSelectors = [
-      'input[placeholder*="address"]',
-      'input[placeholder*="Address"]',
-      'input[aria-label*="address"]',
-      'input[aria-label*="Address"]',
-      'input[id*="address"]',
-      'input[id*="Address"]',
-      'input[name*="address"]',
-      'input[name*="Address"]'
-    ];
+    // 5) Click the search button using the ID from the onkeypress attribute
+    await page.click('#ctlBodyPane_ctl01_ctl01_btnSearch');
 
-    for (const selector of singleAddressSelectors) {
-      try {
-        const input = await page.$(selector);
-        if (input) {
-          console.log(`Found address input with selector: ${selector}`);
-          await input.click({ clickCount: 3 });
-          await input.type(norm);
-          inputFound = true;
-          break;
-        }
-      } catch (e) {
-        continue;
-      }
-    }
-
-    // Strategy 2: If no single input, try street number + street name
-    if (!inputFound) {
-      console.log('Trying split address approach...');
-      const parts = norm.split(' ');
-      const streetNumber = parts[0];
-      const streetName = parts.slice(1).join(' ');
-
-      // Try various selectors for street number
-      const numberSelectors = [
-        'input[name="txtStreetNumber"]',
-        'input[name*="StreetNumber"]',
-        'input[placeholder*="Street Number"]',
-        'input[placeholder*="street number"]',
-        'input[aria-label*="Street Number"]'
-      ];
-
-      const nameSelectors = [
-        'input[name="txtStreetName"]',
-        'input[name*="StreetName"]',
-        'input[placeholder*="Street Name"]',
-        'input[placeholder*="street name"]',
-        'input[aria-label*="Street Name"]'
-      ];
-
-      let numberInput = null;
-      let nameInput = null;
-
-      for (const selector of numberSelectors) {
-        numberInput = await page.$(selector);
-        if (numberInput) break;
-      }
-
-      for (const selector of nameSelectors) {
-        nameInput = await page.$(selector);
-        if (nameInput) break;
-      }
-
-      if (numberInput && nameInput) {
-        await numberInput.click({ clickCount: 3 });
-        await numberInput.type(streetNumber);
-        await nameInput.click({ clickCount: 3 });
-        await nameInput.type(streetName);
-        inputFound = true;
-      }
-    }
-
-    // Strategy 3: Use XPath to find inputs by label text
-    if (!inputFound) {
-      console.log('Trying XPath approach...');
-      try {
-        // Look for any label containing "address" and get its associated input
-        const addressLabels = await page.$x('//label[contains(translate(., "ADDRESS", "address"), "address")]');
-        for (const label of addressLabels) {
-          const forAttr = await page.evaluate(el => el.getAttribute('for'), label);
-          if (forAttr) {
-            const input = await page.$(`#${forAttr}`);
-            if (input) {
-              await input.click({ clickCount: 3 });
-              await input.type(norm);
-              inputFound = true;
-              break;
-            }
-          }
-        }
-      } catch (e) {
-        console.log('XPath approach failed:', e.message);
-      }
-    }
-
-    if (!inputFound) {
-      throw new Error('Could not find address input fields on the page');
-    }
-
-    // 5) Find and click the search button
-    const searchSelectors = [
-      'input[type="submit"][value="Search"]',
-      'input[type="button"][value="Search"]',
-      'button:has-text("Search")',
-      'button[type="submit"]',
-      'input[value*="Search"]',
-      'button[aria-label*="Search"]'
-    ];
-
-    let searchClicked = false;
-    for (const selector of searchSelectors) {
-      try {
-        const btn = await page.$(selector);
-        if (btn) {
-          await btn.click();
-          searchClicked = true;
-          break;
-        }
-      } catch (e) {
-        continue;
-      }
-    }
-
-    if (!searchClicked) {
-      console.log('No search button found, trying Enter key...');
-      await page.keyboard.press('Enter');
-    }
-
-    // 6) Wait for results
-    await page.waitForSelector('table.searchResultsGrid a, div.searchResults a, a[href*="Parcel"]', { timeout: 15000 });
+    // 6) Wait for results table
+    await page.waitForSelector('table.searchResultsGrid a, table a[href*="KeyValue"]', { timeout: 15000 });
     
     // Click first result
-    const firstResult = await page.$('table.searchResultsGrid a, div.searchResults a, a[href*="Parcel"]');
+    const firstResult = await page.$('table.searchResultsGrid a, table a[href*="KeyValue"]');
     await firstResult.click();
 
-    // 7) Wait for owner info
+    // 7) Wait for the property details page to load
     await page.waitForFunction(
       () => {
         const text = document.body.innerText;
@@ -208,14 +88,15 @@ async function fetchOwnerData(address) {
       let owner = 'Not found';
       let mailing = 'Not found';
       
-      // Try different patterns
-      const cells = Array.from(document.querySelectorAll('td, div'));
+      // Get all table cells
+      const cells = Array.from(document.querySelectorAll('td'));
       
       for (let i = 0; i < cells.length; i++) {
         const cellText = cells[i].textContent || '';
         
-        // Owner patterns
-        if (/Most Current Owner|Owner Name|Current Owner/i.test(cellText)) {
+        // Look for owner
+        if (/Most Current Owner/i.test(cellText)) {
+          // The owner name is typically in the next cell
           if (cells[i + 1]) {
             owner = clean(cells[i + 1].textContent);
           } else if (cells[i].nextElementSibling) {
@@ -223,8 +104,9 @@ async function fetchOwnerData(address) {
           }
         }
         
-        // Mailing patterns
+        // Look for mailing address
         if (/Mailing Address/i.test(cellText)) {
+          // The mailing address is typically in the next cell
           if (cells[i + 1]) {
             mailing = clean(cells[i + 1].textContent);
           } else if (cells[i].nextElementSibling) {
@@ -244,15 +126,6 @@ async function fetchOwnerData(address) {
 
   } catch (err) {
     console.error('Scrape error:', err);
-    
-    // Take a screenshot for debugging
-    try {
-      await page.screenshot({ path: 'error-screenshot.png', fullPage: true });
-      console.log('Screenshot saved as error-screenshot.png');
-    } catch (screenshotErr) {
-      console.log('Could not save screenshot');
-    }
-    
     return { success: false, error: err.message };
   } finally {
     await browser.close();
