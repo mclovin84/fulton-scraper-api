@@ -1,6 +1,6 @@
 // server.js – Fulton County Property Owner Lookup API
 
-const express   = require('express');
+const express = require('express');
 const puppeteer = require('puppeteer-core');
 
 const app = express();
@@ -20,14 +20,12 @@ function normalizeAddress(address) {
     'SKYWAY':'SKWY','SQUARE':'SQ','TURNPIKE':'TPKE',
     'NORTH':'N','SOUTH':'S','EAST':'E','WEST':'W',
     'NORTHEAST':'NE','NORTHWEST':'NW','SOUTHEAST':'SE','SOUTHWEST':'SW',
-    'MARTIN LUTHER KING JR':'M L KING JR','MARTIN LUTHER KING':'M L KING',
-    'MLK':'M L KING'
+    'MARTIN LUTHER KING JR':'M L KING JR','MARTIN LUTHER KING':'M L KING','MLK':'M L KING'
   };
   let s = address.toUpperCase().replace(/[.,#]/g,' ');
   for (let [k,v] of Object.entries(ABBREV)) {
     s = s.replace(new RegExp(`\\b${k}\\b`,'g'), v);
   }
-  // Strip trailing GA/ZIP/city
   s = s.replace(/\b(ATLANTA|AUGUSTA|COLUMBUS|MACON|SAVANNAH|ATHENS|GA|GEORGIA)\b.*$/,'').trim();
   return s.replace(/\s+/g,' ');
 }
@@ -40,36 +38,42 @@ async function fetchOwnerData(address) {
   const page = await browser.newPage();
 
   try {
-    // 1) Go to search page
+    // 1) Navigate to search page
     await page.goto(
       'https://qpublic.schneidercorp.com/Application.aspx?App=FultonCountyGA&Layer=Parcels&PageType=Search',
       { waitUntil:'networkidle2', timeout:30000 }
     );
 
-    // 2) Accept Terms if present (no change needed)
-
-    // 3) Wait for “Search by Location Address” input (node="102")
-    const addressInput = await page.waitForSelector('input[node="102"]', { timeout:10000 });
-    
-    // 4) Type normalized address
-    const norm = normalizeAddress(address);
-    await addressInput.click({ clickCount:3 });
-    await addressInput.type(norm);
-
-    // 5) Click its Search link (node="297")
-    const searchLink = await page.$('a[node="297"]');
-    if (searchLink) {
-      await searchLink.click();
-    } else {
-      // fallback: press Enter
-      await page.keyboard.press('Enter');
+    // 2) Accept terms if present
+    try {
+      const btn = await page.$('input[type="submit"][value*="Agree"], input[type="button"][value*="Accept"]');
+      if (btn) {
+        await btn.click();
+        await page.waitForTimeout(1000);
+      }
+    } catch (e) {
+      // continue if no button
     }
 
-    // 6) Wait for results list and click the first listing
+    // 3) Wait for "Search by Location Address" input
+    //    Placeholder value: "Enter address or range of address (ex: 1200-1299 Main)"
+    const addressSelector = 'input[placeholder*="Enter address or range of address"]';
+    await page.waitForSelector(addressSelector, { timeout:10000 });
+
+    // 4) Type normalized address
+    const norm = normalizeAddress(address);
+    await page.click(addressSelector, { clickCount: 3 });
+    await page.type(addressSelector, norm);
+
+    // 5) Click the Search button adjacent to that input
+    //    The Search button is an <input> with value="Search"
+    await page.click('input[type="submit"][value="Search"]');
+
+    // 6) Wait for results grid and click first parcel link
     await page.waitForSelector('table.searchResultsGrid a', { timeout:15000 });
     await page.click('table.searchResultsGrid a');
 
-    // 7) Wait for “Most Current Owner” cell
+    // 7) Wait for the "Most Current Owner" cell
     await page.waitForSelector('td:has-text("Most Current Owner")', { timeout:15000 });
 
     // 8) Extract owner & mailing address
@@ -77,17 +81,14 @@ async function fetchOwnerData(address) {
       const clean = txt => txt.replace(/\s+/g,' ').trim();
       let o='Not found', m='Not found';
       const cells = Array.from(document.querySelectorAll('td'));
-      // Owner
       const ownerTd = cells.find(td => /Most Current Owner/i.test(td.textContent));
       if (ownerTd?.nextElementSibling) o = clean(ownerTd.nextElementSibling.textContent);
-      // Mailing
       const mailTd = cells.find(td => /Mailing Address/i.test(td.textContent));
       if (mailTd?.nextElementSibling) m = clean(mailTd.nextElementSibling.textContent);
       return { owner:o, mailing:m };
     });
 
     return { success:true, owner_name:owner, mailing_address:mailing };
-
   } catch (err) {
     console.error('Scrape error:', err);
     return { success:false, error:err.message };
@@ -105,8 +106,8 @@ app.post('/fulton-property-search', async (req, res) => {
 });
 
 // Root and health routes
-app.get('/',      (req,res) => res.send('Fulton Scraper API running'));
-app.get('/health',(req,res) => res.json({ ok:true, ts: Date.now() }));
+app.get('/',      (req, res) => res.send('Fulton Scraper API running'));
+app.get('/health',(req, res) => res.json({ ok:true, ts:Date.now() }));
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`API listening on port ${PORT}`));
